@@ -1,0 +1,130 @@
+from typing import List
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.transforms.functional as TF
+from ..base_attack import BaseAttack
+
+
+class BSR(BaseAttack):
+    """
+    Block Shuffle and Rotation (BSR)
+
+    Paper:
+        Title: Boosting Adversarial Transferability by Block Shuffle and Rotation
+        Authors: Kunyu Wang, Xuanran He, Wenxuan Wang, and Xiaosen Wang
+        Link: https://ieeexplore.ieee.org/abstract/document/10656871
+        GitHub: https://github.com/Trustworthy-AI-Group/BSR
+    """
+
+
+    def __init__(
+        self,
+        model,
+        eps: float=8 / 255,
+        alpha: float=2 / 255,
+        steps: int=10,
+        decay: float=0.9,
+        num_block: int=2,
+        num_copies: int=5,
+        max_angles: float=0.2,
+        attack_name: str="BSR"
+    ):
+        super().__init__(model=model, eps=eps, alpha=alpha, steps=steps, attack_name=attack_name)
+        self.decay = decay
+        self.num_block = num_block
+        self.num_copies = num_copies
+        self.max_angles = max_angles  # Max rotation angle in Radians
+
+    def _get_random_partition(self, length: int, num_block: int) -> List[int]:
+        """Partitions a dimension length into `num_block` random integer segments >= 1."""
+        if length < num_block:
+            raise ValueError(f"Length ({length}) must be >= num_block ({num_block})")
+
+        rem_length = length - num_block
+        rand = np.random.uniform(size=num_block)
+        
+        rand_norm = np.round(rand * rem_length / rand.sum()).astype(int)
+        rand_norm[rand_norm.argmax()] += rem_length - rand_norm.sum()
+        
+        return (rand_norm + 1).tolist()
+
+    def _rotate_batch(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotates each item in batch `x` by a random angle sampled from truncated normal."""
+        B = x.shape[0]
+        angles_rad = torch.empty(B, device=x.device)
+        nn.init.trunc_normal_(angles_rad, mean=0.0, std=self.max_angles, a=-2.0, b=2.0)
+        angles_deg = torch.rad2deg(angles_rad)
+
+        rotated_list = []
+        for b in range(B):
+            rot_img = TF.rotate(
+                x[b : b + 1],
+                angle=angles_deg[b].item(),
+                interpolation=TF.InterpolationMode.BILINEAR,
+            )
+            rotated_list.append(rot_img)
+        return torch.cat(rotated_list, dim=0)
+
+    def _shuffle_rotate(self, x: torch.Tensor) -> torch.Tensor:
+        """Splits image tensor (B, C, H, W) into random blocks, permutes, and rotates them."""
+        _, _, H, W = x.shape
+
+        height_lengths = self._get_random_partition(H, self.num_block)
+        width_lengths = self._get_random_partition(W, self.num_block)
+
+        width_perm = np.random.permutation(self.num_block)
+        height_perm = np.random.permutation(self.num_block)
+
+        x_split_w = torch.split(x, width_lengths, dim=3)
+        x_split_w_perm = [x_split_w[i] for i in width_perm]
+
+        processed_strips = []
+        for strip in x_split_w_perm:
+            strip_split_h = torch.split(strip, height_lengths, dim=2)
+            rotated_h_blocks = []
+            for i in height_perm:
+                block = strip_split_h[i]
+                rotated_block = self._rotate_batch(block)
+                rotated_h_blocks.append(rotated_block)
+
+            processed_strip = torch.cat(rotated_h_blocks, dim=2)
+            processed_strips.append(processed_strip)
+
+        return torch.cat(processed_strips, dim=3)
+
+    def forward(self, images: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Executes the BSR attack forward optimization loop."""
+        images = images.clone().detach().to(self.device)
+        labels = labels.clone().detach().to(self.device)
+
+        momentum = torch.zeros_like(images).detach().to(self.device)
+        loss_fn = nn.CrossEntropyLoss()
+        adv_images = images.clone().detach()
+
+        for _ in range(self.steps):
+            grad = torch.zeros_like(adv_images)
+
+            for _ in range(self.num_copies):
+                adv_images_copy = adv_images.clone().detach().requires_grad_(True)
+
+                x_bsr = self._shuffle_rotate(adv_images_copy)
+                outputs = self.get_logits(x_bsr)
+                loss = loss_fn(outputs, labels)
+
+                g = torch.autograd.grad(
+                    loss, adv_images_copy, retain_graph=False, create_graph=False
+                )[0]
+                grad += g
+
+
+            grad_norm = grad / (
+                torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8
+            )
+            momentum = self.decay * momentum + grad_norm
+
+            adv_images = adv_images.detach() + self.alpha * momentum.sign()
+            delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
+            adv_images = torch.clamp(images + delta, min=0.0, max=1.0).detach()
+
+        return adv_images
