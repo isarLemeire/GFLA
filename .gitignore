@@ -1,10 +1,8 @@
 figures/
 jupyter/
-results/
 models/
 NIPS2017
 experiments/
-*.csv
 *.pyc
 *.log
 __pycache__/

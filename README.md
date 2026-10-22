@@ -115,4 +115,4 @@ Of these attacks, `BIM`, `MIFGSM`, `NIFGSM`, `DIFGSM`, `TIFGSM`, `SINIFGSM`, `VM
 
 ## License
 
-This project is released under the [MIT License](https://www.google.com/search?q=LICENSE).
+This project is released under the MIT License.
